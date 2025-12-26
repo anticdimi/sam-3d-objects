@@ -2,8 +2,8 @@
 import os
 
 # not ideal to put that here
-os.environ["CUDA_HOME"] = os.environ["CONDA_PREFIX"]
-os.environ["LIDRA_SKIP_INIT"] = "true"
+os.environ['CUDA_HOME'] = os.environ['CONDA_PREFIX']
+os.environ['LIDRA_SKIP_INIT'] = 'true'
 
 import sys
 from typing import Union, Optional, List, Callable
@@ -33,10 +33,10 @@ from sam3d_objects.model.backbone.tdfy_dit.utils import render_utils
 
 from sam3d_objects.utils.visualization import SceneVisualizer
 
-__all__ = ["Inference"]
+__all__ = ['Inference']
 
 WHITELIST_FILTERS = [
-    lambda target: target.split(".", 1)[0] in {"sam3d_objects", "torch", "torchvision", "moge"},
+    lambda target: target.split('.', 1)[0] in {'sam3d_objects', 'torch', 'torchvision', 'moge'},
 ]
 
 BLACKLIST_FILTERS = [
@@ -82,11 +82,19 @@ BLACKLIST_FILTERS = [
 class Inference:
     # public facing inference API
     # only put publicly exposed arguments here
-    def __init__(self, config_file: str, compile: bool = False):
+    def __init__(
+        self,
+        config_file: str,
+        compile: bool = False,
+        stage1_only: bool = False,
+        decode_formats: List[str] = ['mesh', 'gaussian'],
+    ):
         # load inference pipeline
         config = OmegaConf.load(config_file)
-        config.rendering_engine = "pytorch3d"  # overwrite to disable nvdiffrast
+        config.rendering_engine = 'pytorch3d'  # overwrite to disable nvdiffrast
         config.compile_model = compile
+        config.stage1_only = stage1_only
+        config.decode_formats = decode_formats
         config.workspace_dir = os.path.dirname(config_file)
         check_hydra_safety(config, WHITELIST_FILTERS, BLACKLIST_FILTERS)
         self._pipeline: InferencePipelinePointMap = instantiate(config)
@@ -104,19 +112,33 @@ class Inference:
         mask: Optional[Union[None, Image.Image, np.ndarray]],
         seed: Optional[int] = None,
         pointmap=None,
+        stage1_only: Optional[bool] = None,
+        decode_formats: Optional[List[str]] = None,
+        with_texture_baking: Optional[bool] = None,
     ) -> dict:
         image = self.merge_mask_to_rgba(image, mask)
+        if stage1_only is None:
+            stage1_only = self._pipeline.stage1_only
+
+        if decode_formats is None:
+            decode_formats = self._pipeline.decode_formats
+
+        if with_texture_baking is None:
+            # Default to False if we are in mesh-only mode to save VRAM
+            with_texture_baking = 'gaussian' in decode_formats
+
         return self._pipeline.run(
             image,
             None,
             seed,
-            stage1_only=False,
-            with_mesh_postprocess=False,
-            with_texture_baking=False,
+            stage1_only=stage1_only,
+            with_mesh_postprocess=not stage1_only,
+            with_texture_baking=with_texture_baking,
             with_layout_postprocess=True,
             use_vertex_color=True,
             stage1_inference_steps=None,
             pointmap=pointmap,
+            decode_formats=decode_formats,
         )
 
 
@@ -170,10 +192,7 @@ def render_video(
     yaw_start_deg=-90,
     **kwargs,
 ):
-
-    yaws = (
-        torch.linspace(0, 2 * torch.pi, num_frames) + math.radians(yaw_start_deg)
-    ).tolist()
+    yaws = (torch.linspace(0, 2 * torch.pi, num_frames) + math.radians(yaw_start_deg)).tolist()
     pitch = [math.radians(pitch_deg)] * num_frames
 
     extr, intr = _yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitch, r, fov)
@@ -182,7 +201,7 @@ def render_video(
         sample,
         extr,
         intr,
-        {"resolution": resolution, "bg_color": bg_color, "backend": "gsplat"},
+        {'resolution': resolution, 'bg_color': bg_color, 'backend': 'gsplat'},
         **kwargs,
     )
 
@@ -223,9 +242,7 @@ def normalized_gaussian(scene_gs, in_place=False, outlier_percentile=None):
     orig_scale = scene_gs.get_scaling
 
     active_mask = (scene_gs.get_opacity > 0.9).squeeze()
-    inv_scale = (
-        orig_xyz[active_mask].max(dim=0)[0] - orig_xyz[active_mask].min(dim=0)[0]
-    ).max()
+    inv_scale = (orig_xyz[active_mask].max(dim=0)[0] - orig_xyz[active_mask].min(dim=0)[0]).max()
     norm_scale = orig_scale / inv_scale
     norm_xyz = orig_xyz / inv_scale
 
@@ -257,54 +274,52 @@ def make_scene(*outputs, in_place=False):
         outputs = [deepcopy(output) for output in outputs]
 
     all_outs = []
-    minimum_kernel_size = float("inf")
+    minimum_kernel_size = float('inf')
     for output in outputs:
         # move gaussians to scene frame of reference
         PC = SceneVisualizer.object_pointcloud(
-            points_local=output["gaussian"][0].get_xyz.unsqueeze(0),
-            quat_l2c=output["rotation"],
-            trans_l2c=output["translation"],
-            scale_l2c=output["scale"],
+            points_local=output['gaussian'][0].get_xyz.unsqueeze(0),
+            quat_l2c=output['rotation'],
+            trans_l2c=output['translation'],
+            scale_l2c=output['scale'],
         )
-        output["gaussian"][0].from_xyz(PC.points_list()[0])
+        output['gaussian'][0].from_xyz(PC.points_list()[0])
         # must ... ROTATE
-        output["gaussian"][0].from_rotation(
+        output['gaussian'][0].from_rotation(
             quaternion_multiply(
-                quaternion_invert(output["rotation"]),
-                output["gaussian"][0].get_rotation,
+                quaternion_invert(output['rotation']),
+                output['gaussian'][0].get_rotation,
             )
         )
-        scale = output["gaussian"][0].get_scaling
-        adjusted_scale = scale * output["scale"]
+        scale = output['gaussian'][0].get_scaling
+        adjusted_scale = scale * output['scale']
         assert (
-            output["scale"][0, 0].item()
-            == output["scale"][0, 1].item()
-            == output["scale"][0, 2].item()
+            output['scale'][0, 0].item()
+            == output['scale'][0, 1].item()
+            == output['scale'][0, 2].item()
         )
-        output["gaussian"][0].mininum_kernel_size *= output["scale"][0, 0].item()
+        output['gaussian'][0].mininum_kernel_size *= output['scale'][0, 0].item()
         adjusted_scale = torch.maximum(
             adjusted_scale,
             torch.tensor(
-                output["gaussian"][0].mininum_kernel_size * 1.1,
+                output['gaussian'][0].mininum_kernel_size * 1.1,
                 device=adjusted_scale.device,
             ),
         )
-        output["gaussian"][0].from_scaling(adjusted_scale)
+        output['gaussian'][0].from_scaling(adjusted_scale)
         minimum_kernel_size = min(
             minimum_kernel_size,
-            output["gaussian"][0].mininum_kernel_size,
+            output['gaussian'][0].mininum_kernel_size,
         )
         all_outs.append(output)
 
     # merge gaussians
-    scene_gs = all_outs[0]["gaussian"][0]
+    scene_gs = all_outs[0]['gaussian'][0]
     scene_gs.mininum_kernel_size = minimum_kernel_size
     for out in all_outs[1:]:
-        out_gs = out["gaussian"][0]
+        out_gs = out['gaussian'][0]
         scene_gs._xyz = torch.cat([scene_gs._xyz, out_gs._xyz], dim=0)
-        scene_gs._features_dc = torch.cat(
-            [scene_gs._features_dc, out_gs._features_dc], dim=0
-        )
+        scene_gs._features_dc = torch.cat([scene_gs._features_dc, out_gs._features_dc], dim=0)
         scene_gs._scaling = torch.cat([scene_gs._scaling, out_gs._scaling], dim=0)
         scene_gs._rotation = torch.cat([scene_gs._rotation, out_gs._rotation], dim=0)
         scene_gs._opacity = torch.cat([scene_gs._opacity, out_gs._opacity], dim=0)
@@ -335,8 +350,8 @@ def check_hydra_safety(
         node = to_check.pop()
         if isinstance(node, DictConfig):
             to_check.extend(list(node.values()))
-            if "_target_" in node:
-                check_target(node["_target_"], whitelist_filters, blacklist_filters)
+            if '_target_' in node:
+                check_target(node['_target_'], whitelist_filters, blacklist_filters)
         elif isinstance(node, ListConfig):
             to_check.extend(list(node))
 
@@ -356,23 +371,23 @@ def load_mask(path):
     return mask
 
 
-def load_single_mask(folder_path, index=0, extension=".png"):
+def load_single_mask(folder_path, index=0, extension='.png'):
     masks = load_masks(folder_path, [index], extension)
     return masks[0]
 
 
-def load_masks(folder_path, indices_list=None, extension=".png"):
+def load_masks(folder_path, indices_list=None, extension='.png'):
     masks = []
     indices_list = [] if indices_list is None else list(indices_list)
     if not len(indices_list) > 0:  # get all all masks if not provided
         idx = 0
-        while os.path.exists(os.path.join(folder_path, f"{idx}{extension}")):
+        while os.path.exists(os.path.join(folder_path, f'{idx}{extension}')):
             indices_list.append(idx)
             idx += 1
 
     for idx in indices_list:
-        mask_path = os.path.join(folder_path, f"{idx}{extension}")
-        assert os.path.exists(mask_path), f"Mask path {mask_path} does not exist"
+        mask_path = os.path.join(folder_path, f'{idx}{extension}')
+        assert os.path.exists(mask_path), f'Mask path {mask_path} does not exist'
         mask = load_mask(mask_path)
         masks.append(mask)
     return masks
@@ -380,13 +395,13 @@ def load_masks(folder_path, indices_list=None, extension=".png"):
 
 def display_image(image, masks=None):
     def imshow(image, ax):
-        ax.axis("off")
+        ax.axis('off')
         ax.imshow(image)
 
     grid = (1, 1) if masks is None else (2, 2)
     fig, axes = plt.subplots(*grid)
     if masks is not None:
-        mask_colors = sns.color_palette("husl", len(masks))
+        mask_colors = sns.color_palette('husl', len(masks))
         black_image = np.zeros_like(image[..., :3], dtype=float)  # background
         mask_display = np.copy(black_image)
         mask_union = np.zeros_like(image[..., :3])
@@ -406,9 +421,9 @@ def display_image(image, masks=None):
 
 def interactive_visualizer(ply_path):
     with gr.Blocks() as demo:
-        gr.Markdown("# 3D Gaussian Splatting (black-screen loading might take a while)")
+        gr.Markdown('# 3D Gaussian Splatting (black-screen loading might take a while)')
         gr.Model3D(
             value=ply_path,  # splat file
-            label="3D Scene",
+            label='3D Scene',
         )
     demo.launch(share=True)
