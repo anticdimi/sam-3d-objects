@@ -5,7 +5,11 @@ import torch
 from collections.abc import Iterable
 import inspect
 import ast
-import astor
+
+try:
+    import astor  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    astor = None
 from torch.utils import _pytree
 
 # None = root, Iterable[Any] = path, Any = path of one
@@ -34,9 +38,9 @@ def tree_transpose_level_one(
         inner_spec = children_spec[0]
         if check_children:
             for child_spec in children_spec[1:]:
-                assert (
-                    inner_spec == child_spec
-                ), f"one child was found having a different tree structure ({inner_spec} != {child_spec})"
+                assert inner_spec == child_spec, (
+                    f'one child was found having a different tree structure ({inner_spec} != {child_spec})'
+                )
 
         structure = optree.tree_transpose(outer_spec, inner_spec, structure)
 
@@ -44,9 +48,7 @@ def tree_transpose_level_one(
         structure = optree.tree_map(
             map_fn,
             structure,
-            is_leaf=lambda x: optree.tree_structure(
-                x, is_leaf=is_leaf, none_is_leaf=True
-            )
+            is_leaf=lambda x: optree.tree_structure(x, is_leaf=is_leaf, none_is_leaf=True)
             == outer_spec,
             none_is_leaf=True,
         )
@@ -134,10 +136,7 @@ def build_args_batch_extractor(args_mapping: ArgsType):
 
 def build_kwargs_batch_extractor(kwargs_mapping: KwargsType):
     def extract_fn(batch):
-        return {
-            name: get_child(batch, *as_keys(path))
-            for name, path in kwargs_mapping.items()
-        }
+        return {name: get_child(batch, *as_keys(path)) for name, path in kwargs_mapping.items()}
 
     return extract_fn
 
@@ -160,11 +159,7 @@ def build_batch_extractor(mapping: MappingType):
     elif mapping is kwargs_identity_mapping:
         extract_kwargs_fn = lambda x: x
     elif isinstance(mapping, Sequence) and (not isinstance(mapping, str)):
-        if (
-            len(mapping) == 2
-            and isinstance(mapping[0], Sequence)
-            and isinstance(mapping[1], Dict)
-        ):
+        if len(mapping) == 2 and isinstance(mapping[0], Sequence) and isinstance(mapping[1], Dict):
             extract_args_fn = build_args_batch_extractor(mapping[0])
             extract_kwargs_fn = build_kwargs_batch_extractor(mapping[1])
         else:
@@ -192,12 +187,12 @@ def right_broadcasting(arr, target):
 def get_stats(tensor: torch.Tensor):
     float_tensor = tensor.float()
     return {
-        "shape": tuple(tensor.shape),
-        "min": tensor.min().item(),
-        "max": tensor.max().item(),
-        "mean": float_tensor.mean().item(),
-        "median": tensor.median().item(),
-        "std": float_tensor.std().item(),
+        'shape': tuple(tensor.shape),
+        'min': tensor.min().item(),
+        'max': tensor.max().item(),
+        'mean': float_tensor.mean().item(),
+        'median': tensor.median().item(),
+        'std': float_tensor.std().item(),
     }
 
 
@@ -215,10 +210,14 @@ def _get_caller_arg_name(argnum=0, parent_frame=1):
                 break  # only get the first parent call
 
         # get first argument string (do not handle '=')
-        label = astor.to_source(args[argnum]).strip()
+        if astor is not None:
+            label = astor.to_source(args[argnum]).strip()
+        else:
+            # Python 3.9+ has ast.unparse.
+            label = ast.unparse(args[argnum]).strip()
     except:
         # TODO(Pierre) log exception
-        label = "{label}"
+        label = '{label}'
     return label
 
 
@@ -226,7 +225,7 @@ def print_stats(tensor, label=None):
     if label is None:
         label = _get_caller_arg_name(argnum=0)
     stats = get_stats(tensor)
-    string = f"{label}:\n" + "\n".join(f"- {k}: {v}" for k, v in stats.items())
+    string = f'{label}:\n' + '\n'.join(f'- {k}: {v}' for k, v in stats.items())
     print(string)
 
 
@@ -238,6 +237,6 @@ def tree_reduce_unique(fn, tree, ensure_unique=True, **kwargs):
         for value in values[1:]:
             if value != first:
                 raise RuntimeError(
-                    f"different values found, {value} and {first} should be the same"
+                    f'different values found, {value} and {first} should be the same'
                 )
     return first

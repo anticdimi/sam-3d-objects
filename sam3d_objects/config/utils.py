@@ -3,32 +3,36 @@ import functools
 from typing import Any, Callable, Union
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
-from hydra.utils import instantiate
+
+try:
+    from hydra.utils import instantiate  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    from sam3d_objects.utils.instantiator import instantiate
 
 TargetType = Union[str, type, Callable[..., Any]]
 ClassOrCallableType = Union[type, Callable[..., Any]]
 
 
-def dump_config(config: DictConfig, path: str = "./config.yaml"):
+def dump_config(config: DictConfig, path: str = './config.yaml'):
     txt = OmegaConf.to_yaml(config, sort_keys=True)
-    with open(path, "w") as f:
+    with open(path, 'w') as f:
         f.write(txt)
 
 
 def locate(path: str) -> Any:
-    if path == "":
-        raise ImportError("Empty path")
+    if path == '':
+        raise ImportError('Empty path')
 
     import builtins
     from importlib import import_module
 
-    parts = [part for part in path.split(".") if part]
+    parts = [part for part in path.split('.') if part]
 
     # load module part
     module = None
     for n in reversed(range(len(parts))):
         try:
-            mod = ".".join(parts[:n])
+            mod = '.'.join(parts[:n])
             module = import_module(mod)
         except Exception as e:
             if n == 0:
@@ -44,14 +48,12 @@ def locate(path: str) -> Any:
 
     # load object path in module
     for part in parts[n:]:
-        mod = mod + "." + part
+        mod = mod + '.' + part
         if not hasattr(obj, part):
             try:
                 import_module(mod)
             except Exception as e:
-                raise ImportError(
-                    f"Encountered error: `{e}` when loading module '{path}'"
-                ) from e
+                raise ImportError(f"Encountered error: `{e}` when loading module '{path}'") from e
         obj = getattr(obj, part)
 
     return obj
@@ -63,15 +65,15 @@ def full_instance_name(instance: Any) -> str:
 
 def full_class_name(klass: Any) -> str:
     module = klass.__module__
-    if module == "builtins":
+    if module == 'builtins':
         return klass.__qualname__  # avoid outputs like 'builtins.str'
-    return module + "." + klass.__qualname__
+    return module + '.' + klass.__qualname__
 
 
 def ensure_is_subclass(child_class: type, parent_class: type) -> None:
     if not issubclass(child_class, parent_class):
         raise RuntimeError(
-            f"class {full_class_name(child_class)} should be a subclass of {full_class_name(parent_class)}"
+            f'class {full_class_name(child_class)} should be a subclass of {full_class_name(parent_class)}'
         )
 
 
@@ -84,7 +86,7 @@ def find_class_or_callable_from_target(
         obj = target
 
     if (not isinstance(obj, type)) and (not callable(obj)):
-        raise ValueError(f"Invalid type ({type(obj)}) found for {target}")
+        raise ValueError(f'Invalid type ({type(obj)}) found for {target}')
 
     return obj
 
@@ -111,8 +113,7 @@ class RecursivePartial:
         def recurse(data):
             if isinstance(data, DictConfig):
                 new_data = {
-                    key_mapping[k] if k in key_mapping else k: recurse(v)
-                    for k, v in data.items()
+                    key_mapping[k] if k in key_mapping else k: recurse(v) for k, v in data.items()
                 }
                 new_data = DictConfig(new_data)
             elif isinstance(data, ListConfig):
@@ -120,16 +121,14 @@ class RecursivePartial:
             elif type(data) in {bool, str, int, float, type(None)}:
                 new_data = data
             else:
-                raise RuntimeError(f"unknow type found : {type(data)}")
+                raise RuntimeError(f'unknow type found : {type(data)}')
 
             return new_data
 
         return recurse(config)
 
     def __init__(self, config):
-        self.config = RecursivePartial.replace_keys(
-            config, {"_rpartial_target_": "_target_"}
-        )
+        self.config = RecursivePartial.replace_keys(config, {'_rpartial_target_': '_target_'})
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return instantiate(self.config)

@@ -1,15 +1,21 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import Any, Callable, Dict, List, Optional, Union, Iterable
-import lightning.pytorch as pl
+
+try:
+    import lightning.pytorch as pl  # type: ignore
+    from lightning.pytorch.utilities.consolidate_checkpoint import (  # type: ignore
+        _format_checkpoint,
+        _load_distributed_checkpoint,
+    )
+except ModuleNotFoundError:  # pragma: no cover
+    pl = None
+    _format_checkpoint = None
+    _load_distributed_checkpoint = None
 import torch
 from pathlib import Path
 import os
 import re
 from loguru import logger
-from lightning.pytorch.utilities.consolidate_checkpoint import (
-    _format_checkpoint,
-    _load_distributed_checkpoint,
-)
 from glob import glob
 
 from sam3d_objects.data.utils import get_child, set_child
@@ -71,10 +77,10 @@ def rename_checkpoint_weights_using_suffix_matching(
 
     # not all names might have been matched
     if i < len(model_names):
-        raise RuntimeError("could not suffix match parameter names")
+        raise RuntimeError('could not suffix match parameter names')
 
     for k, v in name_mapping.items():
-        logger.debug(f"{k} <- {v}")
+        logger.debug(f'{k} <- {v}')
 
     # rename weights according to matches and save to disk
     model_state_out = {k: model_state[v] for k, v in name_mapping.items()}
@@ -87,8 +93,7 @@ def remove_prefix_state_dict_fn(prefix: str):
 
     def state_dict_fn(state_dict):
         return {
-            (key[n:] if key.startswith(prefix) else key): value
-            for key, value in state_dict.items()
+            (key[n:] if key.startswith(prefix) else key): value for key, value in state_dict.items()
         }
 
     return state_dict_fn
@@ -105,18 +110,14 @@ def filter_and_remove_prefix_state_dict_fn(prefix: str):
     n = len(prefix)
 
     def state_dict_fn(state_dict):
-        return {
-            key[n:]: value
-            for key, value in state_dict.items()
-            if key.startswith(prefix)
-        }
+        return {key[n:]: value for key, value in state_dict.items() if key.startswith(prefix)}
 
     return state_dict_fn
 
 
 def get_last_checkpoint(path: str):
-    checkpoints = glob(os.path.join(path, "epoch=*-step=*.ckpt"))
-    prog = re.compile(r"epoch=(\d+)-step=(\d+).ckpt")
+    checkpoints = glob(os.path.join(path, 'epoch=*-step=*.ckpt'))
+    prog = re.compile(r'epoch=(\d+)-step=(\d+).ckpt')
 
     checkpoints_to_sort = []
     for checkpoint in checkpoints:
@@ -129,12 +130,16 @@ def get_last_checkpoint(path: str):
 
     sorted_checkpoints = sorted(checkpoints_to_sort)
     if not len(sorted_checkpoints) > 0:
-        raise RuntimeError(f"no checkpoint has been found at path : {path}")
+        raise RuntimeError(f'no checkpoint has been found at path : {path}')
     return sorted_checkpoints[-1][2]
 
 
 def load_sharded_checkpoint(path: str, device: Optional[str]):
-    if device != "cpu":
+    if _load_distributed_checkpoint is None or _format_checkpoint is None:
+        raise RuntimeError(
+            'Loading sharded Lightning checkpoints requires `lightning`. Install it or use a non-sharded checkpoint.'
+        )
+    if device != 'cpu':
         raise RuntimeError(
             f'loading sharded weights on device "{device}" is not available, please use the "cpu" device instead'
         )
@@ -144,7 +149,7 @@ def load_sharded_checkpoint(path: str, device: Optional[str]):
 
 
 def load_model_from_checkpoint(
-    model: Union[pl.LightningModule, torch.nn.Module],
+    model: torch.nn.Module,
     checkpoint_path: str,
     strict: bool = True,
     device: Optional[str] = None,
@@ -152,10 +157,10 @@ def load_model_from_checkpoint(
     eval: bool = False,
     map_name: Union[Dict[str, str], None] = None,
     remove_name: Union[List[str], None] = None,
-    state_dict_key: Union[None, str, Iterable[str]] = "state_dict",
+    state_dict_key: Union[None, str, Iterable[str]] = 'state_dict',
     state_dict_fn: Optional[Callable[[Any], Any]] = None,
 ):
-    logger.info(f"Loading checkpoint from {checkpoint_path}")
+    logger.info(f'Loading checkpoint from {checkpoint_path}')
     if os.path.isfile(checkpoint_path):
         checkpoint = torch.load(
             checkpoint_path,
@@ -167,8 +172,13 @@ def load_model_from_checkpoint(
     else:  # if neither a file nor a directory, path does not exist
         raise FileNotFoundError(checkpoint_path)
 
-    if isinstance(model, pl.LightningModule):
-        model.on_load_checkpoint(checkpoint)
+    if pl is not None:
+        try:
+            is_lightning_module = isinstance(model, pl.LightningModule)
+        except Exception:
+            is_lightning_module = False
+        if is_lightning_module:
+            model.on_load_checkpoint(checkpoint)
 
     # get state dictionary
     state_dict = checkpoint

@@ -2,4 +2,8 @@
 from .radiance_field import Strivec
 from .octree import DfsOctree as Octree
 from .gaussian import Gaussian
-from .mesh import MeshExtractResult
+
+try:
+    from .mesh import MeshExtractResult
+except ModuleNotFoundError:  # pragma: no cover
+    MeshExtractResult = None
