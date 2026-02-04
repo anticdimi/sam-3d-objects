@@ -246,13 +246,20 @@ class InferencePipelinePointMap(InferencePipeline):
                 with torch.autocast(device_type='cuda', dtype=self.dtype):
                     output = self.depth_model(loaded_image)
             pointmaps = output['pointmaps']
+            intrinsics = output.get('intrinsics', None)
+
+            # Debug logging for intrinsics
+            logger.info(f'MoGe input shape: {loaded_image.shape}')
+            logger.info(f'MoGe pointmap output shape: {pointmaps.shape}')
+            if intrinsics is not None:
+                logger.info(f'MoGe intrinsics (normalized):\n{intrinsics}')
+
             camera_convention_transform = (
                 Transform3d()
                 .rotate(camera_to_pytorch3d_camera(device=self.device).rotation)
                 .to(self.device)
             )
             points_tensor = camera_convention_transform.transform_points(pointmaps)
-            intrinsics = output.get('intrinsics', None)
         else:
             output = {}
             points_tensor = pointmap.to(self.device)
