@@ -1,26 +1,26 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-from typing import Union, Optional
 from copy import deepcopy
+from typing import Optional, Union
+
 import numpy as np
 import torch
-from tqdm import tqdm
 import torchvision
 from loguru import logger
 from PIL import Image
-
 from pytorch3d.renderer import look_at_view_transform
 from pytorch3d.transforms import Transform3d
+from tqdm import tqdm
 
-from sam3d_objects.model.backbone.dit.embedder.pointmap import PointPatchEmbed
-from sam3d_objects.pipeline.inference_pipeline import InferencePipeline
 from sam3d_objects.data.dataset.tdfy.img_and_mask_transforms import (
     get_mask,
 )
 from sam3d_objects.data.dataset.tdfy.transforms_3d import (
     DecomposedTransform,
 )
+from sam3d_objects.model.backbone.dit.embedder.pointmap import PointPatchEmbed
+from sam3d_objects.pipeline.inference_pipeline import InferencePipeline
+from sam3d_objects.pipeline.inference_utils import estimate_plane_area, o3d_plane_estimation
 from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
-from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area
 
 
 def camera_to_pytorch3d_camera(device='cpu') -> DecomposedTransform:
@@ -152,11 +152,12 @@ class InferencePipelinePointMap(InferencePipeline):
                         ss_input_dict, inference_steps=None
                     )
 
-                    _ = self.run_layout_model(
-                        ss_input_dict,
-                        ss_return_dict,
-                        inference_steps=None,
-                    )
+                    if not self.stage1_only:
+                        _ = self.run_layout_model(
+                            ss_input_dict,
+                            ss_return_dict,
+                            inference_steps=None,
+                        )
 
     def _preprocess_image_and_mask_pointmap(
         self, rgb_image, mask_image, pointmap, img_mask_pointmap_joint_transform
@@ -177,7 +178,7 @@ class InferencePipelinePointMap(InferencePipeline):
 
         assert image.ndim == 3  # no batch dimension as of now
         assert image.shape[-1] == 4  # rgba format
-        assert image.dtype == np.uint8  # [0,255] range
+        assert image.dtype == np.uint8 and 1.0 <= image.max() <= 255  # [0,255] range
 
         rgba_image = torch.from_numpy(self.image_to_float(image))
         rgba_image = rgba_image.permute(2, 0, 1).contiguous()
@@ -185,7 +186,9 @@ class InferencePipelinePointMap(InferencePipeline):
         rgb_image_mask = get_mask(rgba_image, None, 'ALPHA_CHANNEL')
 
         preprocessor_return_dict = preprocessor._process_image_mask_pointmap_mess(
-            rgb_image, rgb_image_mask, pointmap
+            torch.tensor(rgb_image),
+            torch.tensor(rgb_image_mask),
+            torch.tensor(pointmap),
         )
 
         # Put in a for loop?
@@ -235,23 +238,62 @@ class InferencePipelinePointMap(InferencePipeline):
         return pointmap_clipped
 
     def compute_pointmap(self, image, pointmap=None):
-        loaded_image = self.image_to_float(image)
-        loaded_image = torch.from_numpy(loaded_image)
-        loaded_mask = loaded_image[..., -1]
-        loaded_image = loaded_image.permute(2, 0, 1).contiguous()[:3]
+        assert image.max() > 1.0, 'Expected image in [0,255] range for pointmap computation'
+        rgba_np = self.image_to_float(image)
+        rgba = torch.from_numpy(rgba_np).to(self.device)
+        loaded_mask = rgba[..., -1]
+        loaded_image = rgba[..., :3].permute(2, 0, 1).contiguous()
+        assert loaded_image.isnan().sum() == 0, 'Loaded image contains NaNs!'
 
         if pointmap is None:
             with torch.no_grad():
-                with torch.autocast(device_type='cuda', dtype=self.dtype):
-                    output = self.depth_model(loaded_image)
+                output = self.depth_model(loaded_image.unsqueeze(0).float())
+
             pointmaps = output['pointmaps']
+            if isinstance(pointmaps, torch.Tensor) and pointmaps.ndim == 4:
+                pointmaps = pointmaps[0]
+
+            if (
+                isinstance(pointmaps, torch.Tensor)
+                and pointmaps.ndim == 3
+                and pointmaps.shape[0] == 3
+            ):
+                pointmaps = pointmaps.permute(1, 2, 0).contiguous()
+            assert (
+                isinstance(pointmaps, torch.Tensor)
+                and pointmaps.ndim == 3
+                and pointmaps.shape[-1] == 3
+            ), (
+                f'Expected depth model pointmaps in HWC format, got {type(pointmaps)} {getattr(pointmaps, "shape", None)}'
+            )
+
+            # MoGe can return +/-inf for invalid pixels (esp. in fp16). Rotation will turn inf into nan
+            # because inf * 0 = nan, so sanitize before camera-convention transform.
+            pointmaps = torch.where(
+                torch.isfinite(pointmaps),
+                pointmaps,
+                torch.full_like(pointmaps, float('nan')),
+            )
+
+            intrinsics = output.get('intrinsics', None)
+
+            # Debug logging for intrinsics
+            logger.info(f'MoGe input shape: {loaded_image.shape}')
+            logger.info(f'MoGe pointmap output shape: {pointmaps.shape}')
+            if intrinsics is not None:
+                logger.info(f'MoGe intrinsics (normalized):\n{intrinsics}')
+
             camera_convention_transform = (
                 Transform3d()
                 .rotate(camera_to_pytorch3d_camera(device=self.device).rotation)
                 .to(self.device)
             )
             points_tensor = camera_convention_transform.transform_points(pointmaps)
-            intrinsics = output.get('intrinsics', None)
+            points_tensor = torch.where(
+                torch.isfinite(points_tensor),
+                points_tensor,
+                torch.full_like(points_tensor, float('nan')),
+            )
         else:
             output = {}
             points_tensor = pointmap.to(self.device)
@@ -329,12 +371,21 @@ class InferencePipelinePointMap(InferencePipeline):
         decode_formats=None,
         estimate_plane=False,
     ) -> dict:
-        if not self.load_slat and not stage1_only:
-            raise ValueError('load_slat=False only supports stage1_only=True')
-
         image = self.merge_image_and_mask(image, mask)
         with self.device:
             pointmap_dict = self.compute_pointmap(image, pointmap)
+
+            # Offload depth model if it was used
+            if pointmap is None and hasattr(self, 'depth_model') and self.depth_model is not None:
+                if hasattr(self.depth_model, 'to'):
+                    logger.info('Moving depth_model to CPU')
+                    self.depth_model.to('cpu')
+                    torch.cuda.empty_cache()
+                elif hasattr(self.depth_model, 'model') and hasattr(self.depth_model.model, 'to'):
+                    logger.info('Moving depth_model.model to CPU')
+                    self.depth_model.model.to('cpu')
+                    torch.cuda.empty_cache()
+
             pointmap = pointmap_dict['pointmap']
             pts = type(self)._down_sample_img(pointmap)
             pts_colors = type(self)._down_sample_img(pointmap_dict['pts_color'])
@@ -344,7 +395,6 @@ class InferencePipelinePointMap(InferencePipeline):
 
             ss_input_dict = self.preprocess_image(image, self.ss_preprocessor, pointmap=pointmap)
 
-            slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             if seed is not None:
                 torch.manual_seed(seed)
             ss_return_dict = self.sample_sparse_structure(
@@ -379,6 +429,12 @@ class InferencePipelinePointMap(InferencePipeline):
                 }
                 # return ss_return_dict
 
+            # Offload stage 1 models to save VRAM for stage 2
+            self.move_to_cpu(['ss_generator', 'ss_decoder', 'ss_encoder', 'ss_condition_embedder'])
+            del ss_input_dict
+            torch.cuda.empty_cache()
+
+            slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             coords = ss_return_dict['coords']
             slat = self.sample_slat(
                 slat_input_dict,
@@ -386,27 +442,30 @@ class InferencePipelinePointMap(InferencePipeline):
                 inference_steps=stage2_inference_steps,
                 use_distillation=use_stage2_distillation,
             )
+            # Offload slat_generator before decoding to save VRAM for decoders
+            self.move_to_cpu(['slat_generator', 'slat_condition_embedder'])
+
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
             )
             outputs = self.postprocess_slat_output(
                 outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
             )
-            glb = outputs.get('glb', None)
+            # glb = outputs.get('glb', None)
 
-            try:
-                if with_layout_postprocess and self.layout_post_optimization_method is not None:
-                    assert glb is not None, 'require mesh to run postprocessing'
-                    logger.info('Running layout post optimization method...')
-                    postprocessed_pose = self.run_post_optimization(
-                        deepcopy(glb),
-                        pointmap_dict['intrinsics'],
-                        ss_return_dict,
-                        ss_input_dict,
-                    )
-                    ss_return_dict.update(postprocessed_pose)
-            except Exception as e:
-                logger.error(f'Error during layout post optimization: {e}', exc_info=True)
+            # try:
+            #     if with_layout_postprocess and self.layout_post_optimization_method is not None:
+            #         assert glb is not None, 'require mesh to run postprocessing'
+            #         logger.info('Running layout post optimization method...')
+            #         postprocessed_pose = self.run_post_optimization(
+            #             deepcopy(glb),
+            #             pointmap_dict['intrinsics'],
+            #             ss_return_dict,
+            #             ss_input_dict,
+            #         )
+            #         ss_return_dict.update(postprocessed_pose)
+            # except Exception as e:
+            #     logger.error(f'Error during layout post optimization: {e}', exc_info=True)
 
             # glb.export("sample.glb")
             logger.info('Finished!')
