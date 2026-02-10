@@ -223,6 +223,19 @@ class InferencePipeline:
             self.slat_mean = torch.tensor(slat_mean)
             self.slat_std = torch.tensor(slat_std)
 
+    def move_to_cpu(self, model_names: List[str]):
+        for name in model_names:
+            if name in self.models and self.models[name] is not None:
+                if hasattr(self.models[name], 'to'):
+                    logger.info(f'Moving {name} to CPU')
+                    self.models[name].to('cpu')
+            if name == 'ss_condition_embedder' or name == 'slat_condition_embedder':
+                model = self.condition_embedders.get(name)
+                if model is not None and hasattr(model, 'to'):
+                    logger.info(f'Moving {name} to CPU')
+                    model.to('cpu')
+        torch.cuda.empty_cache()
+
     def _compile(self):
         torch._dynamo.config.cache_size_limit = 64
         torch._dynamo.config.accumulated_cache_size_limit = 2048
@@ -272,7 +285,6 @@ class InferencePipeline:
 
         for _ in tqdm(range(num_warmup_iters)):
             ss_input_dict = self.preprocess_image(image, self.ss_preprocessor)
-            slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             ss_return_dict = self.sample_sparse_structure(ss_input_dict)
             coords = ss_return_dict['coords']
             slat = self.sample_slat(slat_input_dict, coords)
@@ -493,7 +505,6 @@ class InferencePipeline:
         image = self.merge_image_and_mask(image, mask)
         with self.device:
             ss_input_dict = self.preprocess_image(image, self.ss_preprocessor)
-            slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             torch.manual_seed(seed)
             ss_return_dict = self.sample_sparse_structure(
                 ss_input_dict,
@@ -520,6 +531,9 @@ class InferencePipeline:
                 inference_steps=stage2_inference_steps,
                 use_distillation=use_stage2_distillation,
             )
+            # Offload slat_generator before decoding to save VRAM for decoders
+            self.move_to_cpu(['slat_generator', 'slat_condition_embedder'])
+
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
             )

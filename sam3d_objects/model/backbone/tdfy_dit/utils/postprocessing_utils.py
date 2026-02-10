@@ -651,11 +651,14 @@ def to_glb(
             baseColorTexture=texture,
             baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
         )
+    else:
+        uvs = None
+        material = None
 
     # rotate mesh (from z-up to y-up)
     vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
 
-    if not with_mesh_postprocess and not with_texture_baking and use_vertex_color:
+    if not with_texture_baking and use_vertex_color:
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
         mesh.visual.vertex_colors = vert_colors
     else:
@@ -667,6 +670,7 @@ def to_glb(
                 if with_texture_baking
                 else None
             ),
+            process=False,
         )
 
     return mesh
