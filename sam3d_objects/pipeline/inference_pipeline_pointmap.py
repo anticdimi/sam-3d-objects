@@ -320,12 +320,14 @@ class InferencePipelinePointMap(InferencePipeline):
             'pts_color': loaded_image,
         }
 
-        # If depth model doesn't provide intrinsics, infer them
+        # Always store intrinsics: prefer MoGe's own, fall back to pointmap recovery.
         if intrinsics is None:
             intrinsics_result = infer_intrinsics_from_pointmap(
                 points_tensor.permute(1, 2, 0), device=self.device
             )
             point_map_tensor['intrinsics'] = intrinsics_result['intrinsics']
+        else:
+            point_map_tensor['intrinsics'] = intrinsics
 
         return point_map_tensor
 
