@@ -18,6 +18,7 @@ from pytorch3d.renderer import (
 from pytorch3d.transforms import quaternion_to_matrix, Transform3d
 import random
 import open3d as o3d
+from loguru import logger
 from scipy.ndimage import label, binary_dilation, binary_fill_holes, binary_erosion, minimum_filter
 
 def remove_small_regions(mask, min_area=100):
@@ -94,7 +95,8 @@ def check_occlusion(mask, point_map,
                     min_region_area=25,
                     border_thickness=5,
                     z_thresh=0.3,
-                    min_hole_area=100):
+                    min_hole_area=100,
+                    check_border=True):
     """
     Main function to check different types of occlusion for a given mask and 3D point map.
     """
@@ -103,12 +105,16 @@ def check_occlusion(mask, point_map,
     dilation_iter = 2
     filter_size = 2 * dilation_iter + 1
 
-    # run occlusion checks
-    return (
-        is_near_image_border(cleaned_mask, border_thickness)
-        or is_occluded_by_others(cleaned_mask, point_map, dilation_iter, z_thresh, filter_size)
-        or has_internal_occlusion(cleaned_mask, min_hole_area)
-    )
+    if check_border and is_near_image_border(cleaned_mask, border_thickness):
+        print('[check_occlusion] REJECTED: mask near image border')
+        return True
+    if is_occluded_by_others(cleaned_mask, point_map, dilation_iter, z_thresh, filter_size):
+        print('[check_occlusion] REJECTED: occluded by others')
+        return True
+    if has_internal_occlusion(cleaned_mask, min_hole_area):
+        print('[check_occlusion] REJECTED: internal occlusion detected')
+        return True
+    return False
 
 def get_mesh(Mesh, tfm_ori, device):
     mesh_vertices = Mesh.vertices.copy()

@@ -67,6 +67,7 @@ ROTATION_6D_STD = torch.tensor(
     ]
 )
 
+
 def layout_post_optimization(
     Mesh,
     Quaternion,
@@ -80,10 +81,9 @@ def layout_post_optimization(
     min_size=512,
     device=None,
 ):
-
     set_seed(100)
     if device is None:
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     # init transform and process mesh
     Rotation = quaternion_to_matrix(Quaternion.squeeze(1))
@@ -94,25 +94,22 @@ def layout_post_optimization(
     # get mask and renderer
     mask, renderer = get_mask_renderer(Mask, min_size, Intrinsics, device)
 
-    # check occlusion
-    if check_occlusion(mask[0, 0].cpu().numpy(), Point_Map.cpu().numpy()):
-        return (
-            Quaternion,
-            Translation,
-            Scale,
-            -1.0,
-            False,
-            False,
-        )
+    # check occlusion — disabled for single-object masks (false-positive prone in HOI scenes)
+    # occluded = check_occlusion(mask[0, 0].cpu().numpy(), Point_Map.cpu().numpy(), check_border=False)
+    # print(f'[layout_postopt] Occlusion check result: {occluded}')
+    # if occluded:
+    #     return (Quaternion, Translation, Scale, -1.0, False, False)
 
     # Step 1: Manual Alignment
+    print('[layout_postopt] Running Step 1: Manual Alignment...')
     source_points, target_points, center, tfm1, mesh, ori_iou, final_iou, flag_notgt = (
-        run_alignment(
-            Point_Map, mask, mesh, center, faces_idx, textures, renderer, device
-        )
+        run_alignment(Point_Map, mask, mesh, center, faces_idx, textures, renderer, device)
+    )
+    print(
+        f'[layout_postopt] Step 1 done — ori_iou={ori_iou}, final_iou={final_iou}, flag_notgt={flag_notgt}'
     )
 
-    # return original layout if no target points. 
+    # return original layout if no target points.
     if flag_notgt:
         return (
             Quaternion,
@@ -129,13 +126,9 @@ def layout_post_optimization(
         points_aligned_icp, transformation = run_ICP(
             mesh, source_points, target_points, threshold=0.05
         )
-        mesh_ICP = Meshes(
-            verts=[points_aligned_icp], faces=[faces_idx], textures=textures
-        )
+        mesh_ICP = Meshes(verts=[points_aligned_icp], faces=[faces_idx], textures=textures)
         rendered = renderer(mesh_ICP)
-        ori_iou_shapeICP = compute_iou(
-            rendered[..., 3][0][None, None], mask, threshold=0.5
-        )
+        ori_iou_shapeICP = compute_iou(rendered[..., 3][0][None, None], mask, threshold=0.5)
         # determine whether accept ICP
         if ori_iou_shapeICP > ori_iou:
             mesh = mesh_ICP
@@ -147,17 +140,10 @@ def layout_post_optimization(
             scale = A.norm(dim=1)
             R = A / scale[:, None]
             center = ((center[None] * scale) @ R + t)[0]  # transform center
-            tfm2 = (
-                Transform3d(device=device)
-                .scale(scale[None])
-                .rotate(R[None])
-                .translate(t[None])
-            )
+            tfm2 = Transform3d(device=device).scale(scale[None]).rotate(R[None]).translate(t[None])
         else:
             Flag_ICP = False
-            scale_2, translation_2 = torch.tensor(1).to(device), torch.zeros([3]).to(
-                device
-            )
+            scale_2, translation_2 = torch.tensor(1).to(device), torch.zeros([3]).to(device)
             tfm2 = (
                 Transform3d(device=device)
                 .scale(scale_2.expand(3)[None])
@@ -167,9 +153,7 @@ def layout_post_optimization(
         Flag_ICP = False
         scale_2, translation_2 = torch.tensor(1).to(device), torch.zeros([3]).to(device)
         tfm2 = (
-            Transform3d(device=device)
-            .scale(scale_2.expand(3)[None])
-            .translate(translation_2[None])
+            Transform3d(device=device).scale(scale_2.expand(3)[None]).translate(translation_2[None])
         )
 
     # Step 3: Render-and-Compare
@@ -177,20 +161,23 @@ def layout_post_optimization(
         Flag_optim = False
         tfm = tfm_ori.compose(tfm1).compose(tfm2)
     else:
-        quat, translation, scale, R = run_render_compare(
-            mesh, center, renderer, mask, device
-        )
+        quat, translation, scale, R = run_render_compare(mesh, center, renderer, mask, device)
         with torch.no_grad():
             transformed = apply_transform(mesh, center, quat, translation, scale)
             rendered = renderer(transformed)
-        optimized_iou = compute_iou(
-            rendered[..., 3][0][None, None], mask, threshold=0.5
+        optimized_iou = compute_iou(rendered[..., 3][0][None, None], mask, threshold=0.5)
+        print(
+            f'[layout_postopt] Step 3 done — optimized_iou={optimized_iou:.4f}, '
+            f'ori_iou={ori_iou:.4f}'
         )
-        # Criterior to use layout optimization
-        if optimized_iou < 0.5 or optimized_iou <= ori_iou:
+        # Accept if render-and-compare improved over original, regardless of absolute IoU.
+        # The original 0.5 threshold is too strict for partially-occluded HOI objects
+        # where the full mesh silhouette never matches the visible mask well.
+        if optimized_iou <= ori_iou:
             Flag_optim = False
-            tfm = tfm_ori  # reject manual alignment and ICP as well.
-            # tfm = tfm_ori.compose(tfm1).compose(tfm2)  # only reject render-compare but keep manual alignment and ICP.
+            # Keep manual alignment + ICP even if render-compare didn't help
+            tfm = tfm_ori.compose(tfm1).compose(tfm2)
+            print('[layout_postopt] Step 3 rejected (no improvement), keeping steps 1+2')
         else:
             Flag_optim = True
             final_iou = optimized_iou.detach().cpu().item()
@@ -229,13 +216,13 @@ def pose_decoder(
 
         # BEGIN: copied from generative.py
         key_mapping = {
-            "shape": "x_shape_latent",
-            "quaternion": "x_instance_rotation",
-            "6drotation": "x_instance_rotation_6d",
-            "6drotation_normalized": "x_instance_rotation_6d_normalized",
-            "translation": "x_instance_translation",
-            "scale": "x_instance_scale",
-            "translation_scale": "x_translation_scale",
+            'shape': 'x_shape_latent',
+            'quaternion': 'x_instance_rotation',
+            '6drotation': 'x_instance_rotation_6d',
+            '6drotation_normalized': 'x_instance_rotation_6d_normalized',
+            'translation': 'x_instance_translation',
+            'scale': 'x_instance_scale',
+            'translation_scale': 'x_translation_scale',
         }
 
         # Decodes for metrics
@@ -246,20 +233,18 @@ def pose_decoder(
         # TODO: Hao & Bowen please do clean this up!
         # Convert 6D rotation to quaternion if needed
         if (
-            "x_instance_rotation_6d" in pose_target_dict
-            or "x_instance_rotation_6d_normalized" in pose_target_dict
+            'x_instance_rotation_6d' in pose_target_dict
+            or 'x_instance_rotation_6d_normalized' in pose_target_dict
         ):
             # Extract the two 3D vectors
-            if "x_instance_rotation_6d_normalized" in pose_target_dict:
-                rot_6d = pose_target_dict[
-                    "x_instance_rotation_6d_normalized"
-                ] * ROTATION_6D_STD.to(
-                    pose_target_dict["x_instance_rotation_6d_normalized"].device
+            if 'x_instance_rotation_6d_normalized' in pose_target_dict:
+                rot_6d = pose_target_dict['x_instance_rotation_6d_normalized'] * ROTATION_6D_STD.to(
+                    pose_target_dict['x_instance_rotation_6d_normalized'].device
                 ) + ROTATION_6D_MEAN.to(
-                    pose_target_dict["x_instance_rotation_6d_normalized"].device
+                    pose_target_dict['x_instance_rotation_6d_normalized'].device
                 )
             else:
-                rot_6d = pose_target_dict["x_instance_rotation_6d"]
+                rot_6d = pose_target_dict['x_instance_rotation_6d']
             a1 = rot_6d[..., 0:3]
             a2 = rot_6d[..., 3:6]
 
@@ -278,64 +263,65 @@ def pose_decoder(
 
             # Convert to quaternion
             quaternion = matrix_to_quaternion(rotation_matrix)
-            pose_target_dict["x_instance_rotation"] = quaternion
+            pose_target_dict['x_instance_rotation'] = quaternion
 
-        if "x_instance_scale" in pose_target_dict:
-            pose_target_dict["x_instance_scale"] = torch.exp(
-                pose_target_dict["x_instance_scale"]
+        if 'x_instance_scale' in pose_target_dict:
+            pose_target_dict['x_instance_scale'] = torch.exp(pose_target_dict['x_instance_scale'])
+
+        if 'x_translation_scale' in pose_target_dict:
+            pose_target_dict['x_translation_scale'] = torch.exp(
+                pose_target_dict['x_translation_scale']
             )
 
-        if "x_translation_scale" in pose_target_dict:
-            pose_target_dict["x_translation_scale"] = torch.exp(
-                pose_target_dict["x_translation_scale"]
-            )
-
-        pose_target_dict["pose_target_convention"] = [pose_target_convention] * x[
-            "shape"
-        ].shape[0]
+        pose_target_dict['pose_target_convention'] = [pose_target_convention] * x['shape'].shape[0]
         # END: copied from generative.py
 
         # Fake pointmap moments
-        device = x["shape"].device
-        _scene_scale = (
-            scene_scale if scene_scale is not None else torch.tensor(1.0, device=device)
-        )
+        device = x['shape'].device
+        _scene_scale = scene_scale if scene_scale is not None else torch.tensor(1.0, device=device)
         _scene_shift = (
-            scene_shift
-            if scene_shift is not None
-            else torch.tensor([[0, 0, 0]], device=device)
+            scene_shift if scene_shift is not None else torch.tensor([[0, 0, 0]], device=device)
         )
-        pose_target_dict["x_scene_scale"] = _scene_scale
-        pose_target_dict["x_scene_center"] = _scene_shift
+        pose_target_dict['x_scene_scale'] = _scene_scale
+        pose_target_dict['x_scene_center'] = _scene_shift
 
         # Convert to instance pose
         pose_instance_dict = PoseTargetConverter.dicts_pose_target_to_instance_pose(
             pose_target_convention=pose_target_convention,
-            x_instance_scale=pose_target_dict["x_instance_scale"],
-            x_instance_translation=pose_target_dict["x_instance_translation"],
-            x_instance_rotation=pose_target_dict["x_instance_rotation"],
-            x_translation_scale=pose_target_dict["x_translation_scale"],
-            x_scene_scale=pose_target_dict["x_scene_scale"],
-            x_scene_center=pose_target_dict["x_scene_center"],
+            x_instance_scale=pose_target_dict['x_instance_scale'],
+            x_instance_translation=pose_target_dict['x_instance_translation'],
+            x_instance_rotation=pose_target_dict['x_instance_rotation'],
+            x_translation_scale=pose_target_dict['x_translation_scale'],
+            x_scene_scale=pose_target_dict['x_scene_scale'],
+            x_scene_center=pose_target_dict['x_scene_center'],
         )
         return {
-            "translation": pose_instance_dict["instance_position_l2c"].squeeze(0),
-            "rotation": pose_instance_dict["instance_quaternion_l2c"].squeeze(0),
-            "scale": pose_instance_dict["instance_scale_l2c"].squeeze(0).mean(-1, keepdim=True).expand(1,3),
+            'translation': pose_instance_dict['instance_position_l2c'].squeeze(0),
+            'rotation': pose_instance_dict['instance_quaternion_l2c'].squeeze(0),
+            'scale': pose_instance_dict['instance_scale_l2c']
+            .squeeze(0)
+            .mean(-1, keepdim=True)
+            .expand(1, 3),
         }
 
     return decode
+
 
 def zero_prediction_decoder():
     def decode(model_output_dict, scene_scale=None, scene_shift=None):
         import copy
         from loguru import logger
-        _pose_decoder = pose_decoder("ScaleShiftInvariant")
+
+        _pose_decoder = pose_decoder('ScaleShiftInvariant')
         model_output_dict = copy.deepcopy(model_output_dict)
-        logger.warning("Overwriting predictions to zero prediction")
-        model_output_dict["translation"] = torch.zeros_like(model_output_dict["translation"])
-        model_output_dict["translation_scale"] = torch.zeros_like(model_output_dict["translation_scale"])
-        model_output_dict["scale"] = torch.zeros_like(model_output_dict["scale"]) + 1.337 # Empirical average on R3
+        logger.warning('Overwriting predictions to zero prediction')
+        model_output_dict['translation'] = torch.zeros_like(model_output_dict['translation'])
+        model_output_dict['translation_scale'] = torch.zeros_like(
+            model_output_dict['translation_scale']
+        )
+        model_output_dict['scale'] = (
+            torch.zeros_like(model_output_dict['scale']) + 1.337
+        )  # Empirical average on R3
         return _pose_decoder(model_output_dict, scene_scale, scene_shift)
 
     return decode
@@ -349,11 +335,11 @@ def get_default_pose_decoder():
 
 
 POSE_DECODERS = {
-    "default": get_default_pose_decoder(),
-    "ApparentSize": pose_decoder("ApparentSize"),
-    "DisparitySpace": pose_decoder("DisparitySpace"),
-    "ScaleShiftInvariant": pose_decoder("ScaleShiftInvariant"),
-    "ZeroPredictionScaleShiftInvariant": zero_prediction_decoder(),
+    'default': get_default_pose_decoder(),
+    'ApparentSize': pose_decoder('ApparentSize'),
+    'DisparitySpace': pose_decoder('DisparitySpace'),
+    'ScaleShiftInvariant': pose_decoder('ScaleShiftInvariant'),
+    'ZeroPredictionScaleShiftInvariant': zero_prediction_decoder(),
 }
 
 
@@ -469,9 +455,7 @@ def downsample_sparse_structure(
 
     # If still too many after deduplication, randomly subsample
     if unique_combined.shape[0] > max_coords:
-        indices = torch.randperm(unique_combined.shape[0], device=coord_batch.device)[
-            :max_coords
-        ]
+        indices = torch.randperm(unique_combined.shape[0], device=coord_batch.device)[:max_coords]
         unique_combined = unique_combined[indices]
 
     return unique_combined.int(), downsample_factor
@@ -539,9 +523,7 @@ def trimesh2o3d_mesh(trimesh_mesh):
 def update_layout(pred_t, pred_s, pred_quat, center, scale, to_halo=True):
     if center is None and not to_halo:
         return pred_t, pred_s, pred_quat
-    pred_transform = compose_transform(
-        pred_s, quaternion_to_matrix(pred_quat[0]), pred_t
-    )
+    pred_transform = compose_transform(pred_s, quaternion_to_matrix(pred_quat[0]), pred_t)
     if center is None:
         comb_transform = pred_transform
     else:
@@ -615,44 +597,42 @@ def quat_wxyz_to_euler_XYZ(q: torch.Tensor) -> torch.Tensor:
 
 def format_to_halo(layout_output):
     json_out = {}
-    quaternion = layout_output["quaternion"][0, 0]
-    translation = layout_output["translation"][0]
-    scale = list(layout_output["scale"][0])
+    quaternion = layout_output['quaternion'][0, 0]
+    translation = layout_output['translation'][0]
+    scale = list(layout_output['scale'][0])
 
     euler = quat_wxyz_to_euler_XYZ(quaternion)
-    json_out["roll"] = float(euler[0])
-    json_out["pitch"] = float(euler[1])
-    json_out["yaw"] = float(euler[2])
-    json_out["pred_scale"] = [float(s) for s in scale]
+    json_out['roll'] = float(euler[0])
+    json_out['pitch'] = float(euler[1])
+    json_out['yaw'] = float(euler[2])
+    json_out['pred_scale'] = [float(s) for s in scale]
     rot_matrix = quaternion_to_matrix(quaternion)
     pred_transform = torch.eye(4, dtype=quaternion.dtype).to(quaternion.device)
     pred_transform[:3, :3] = rot_matrix
     pred_transform[:3, 3] = translation
-    pred_transform_list = [
-        [float(t) for t in trans_row] for trans_row in pred_transform
-    ]
-    json_out["pred_transform"] = pred_transform_list
+    pred_transform_list = [[float(t) for t in trans_row] for trans_row in pred_transform]
+    json_out['pred_transform'] = pred_transform_list
     return json_out
 
 
 def json_to_halo_payloads(target_data):
-    pred_transform = target_data["pred_transform"]
-    pred_scale = target_data["pred_scale"]
-    roll = target_data.get("roll", 0)
-    pitch = target_data.get("pitch", 0)
-    yaw = target_data.get("yaw", 0)
+    pred_transform = target_data['pred_transform']
+    pred_scale = target_data['pred_scale']
+    roll = target_data.get('roll', 0)
+    pitch = target_data.get('pitch', 0)
+    yaw = target_data.get('yaw', 0)
     # Update positions, rotation, and scale in the payload
     item_attachments = {}
-    item_attachments["positions"] = {
-        "x": pred_transform[0][3],
-        "y": pred_transform[1][3],
-        "z": pred_transform[2][3] - 1,  # Adjust for Halo design
+    item_attachments['positions'] = {
+        'x': pred_transform[0][3],
+        'y': pred_transform[1][3],
+        'z': pred_transform[2][3] - 1,  # Adjust for Halo design
     }
-    item_attachments["rotation"] = {"x": roll, "y": pitch, "z": yaw}
-    item_attachments["scale"] = {
-        "x": pred_scale[0],
-        "y": pred_scale[1],
-        "z": pred_scale[2],
+    item_attachments['rotation'] = {'x': roll, 'y': pitch, 'z': yaw}
+    item_attachments['scale'] = {
+        'x': pred_scale[0],
+        'y': pred_scale[1],
+        'z': pred_scale[2],
     }
     return item_attachments
 
@@ -663,25 +643,29 @@ def o3d_plane_estimation(points):
     plane_model, inliers = pcd.segment_plane(0.02, 3, 1000)
 
     [a, b, c, d] = plane_model
-    logger.info(f"Plane equation: {a:.2f}x + {b:.2f}y + {c:.2f}z + {d:.2f} = 0")
+    logger.info(f'Plane equation: {a:.2f}x + {b:.2f}y + {c:.2f}z + {d:.2f} = 0')
 
     # Get the inlier points from RANSAC
     inlier_points = np.asarray(pcd.points)[inliers]
 
     # Adaptive flying point removal based on Z-range
     z_range = np.max(inlier_points[:, 2]) - np.min(inlier_points[:, 2])
-    if z_range > 6.0:       # Large range - likely flying points
-        thresh = 0.90       # Remove 10%
-    elif z_range > 2.0:     # Moderate range
-        thresh = 0.93       # Remove 7%
-    else:                   # Small range - clean
-        thresh = 0.95       # Remove 5%
+    if z_range > 6.0:  # Large range - likely flying points
+        thresh = 0.90  # Remove 10%
+    elif z_range > 2.0:  # Moderate range
+        thresh = 0.93  # Remove 7%
+    else:  # Small range - clean
+        thresh = 0.95  # Remove 5%
 
     depth_quantile = np.quantile(inlier_points[:, 2], thresh)
     clean_points = inlier_points[inlier_points[:, 2] <= depth_quantile]
 
-    logger.info(f"Flying point removal: {len(inlier_points)} -> {len(clean_points)} points (z_range: {z_range:.2f}m, thresh: {thresh})")
-    logger.info(f"Clean points Z range: [{clean_points[:, 2].min():.3f}, {clean_points[:, 2].max():.3f}]")
+    logger.info(
+        f'Flying point removal: {len(inlier_points)} -> {len(clean_points)} points (z_range: {z_range:.2f}m, thresh: {thresh})'
+    )
+    logger.info(
+        f'Clean points Z range: [{clean_points[:, 2].min():.3f}, {clean_points[:, 2].max():.3f}]'
+    )
 
     # Get the normal vector of the plane
     normal = np.array([a, b, c])
@@ -704,13 +688,15 @@ def o3d_plane_estimation(points):
     if np.dot(np.cross(v1, v2), normal) < 0:
         v2 = -v2
 
-    logger.info(f"Plane basis vectors - v1: [{v1[0]:.3f}, {v1[1]:.3f}, {v1[2]:.3f}], v2: [{v2[0]:.3f}, {v2[1]:.3f}, {v2[2]:.3f}]")
+    logger.info(
+        f'Plane basis vectors - v1: [{v1[0]:.3f}, {v1[1]:.3f}, {v1[2]:.3f}], v2: [{v2[0]:.3f}, {v2[1]:.3f}, {v2[2]:.3f}]'
+    )
 
     # Calculate centroid using bounding box center (more robust to density bias)
     min_vals = np.min(clean_points, axis=0)
     max_vals = np.max(clean_points, axis=0)
     centroid = (min_vals + max_vals) / 2
-    logger.info(f"Bbox centroid: [{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}]")
+    logger.info(f'Bbox centroid: [{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}]')
 
     # Project clean points onto the plane's coordinate system
     relative_points = clean_points - centroid
@@ -728,7 +714,7 @@ def o3d_plane_estimation(points):
     # Ensure minimum size
     u_extent = max(u_extent, 0.1)  # minimum 10cm
     v_extent = max(v_extent, 0.1)
-    logger.info(f"Plane size: {u_extent:.3f}m x {v_extent:.3f}m")
+    logger.info(f'Plane size: {u_extent:.3f}m x {v_extent:.3f}m')
 
     # Calculate direction away from camera center (at origin [0,0,0])
     camera_pos = np.array([0, 0, 0])  # Camera at origin
@@ -747,9 +733,9 @@ def o3d_plane_estimation(points):
         perp_axis = np.cross(normal, away_axis)  # Perpendicular to away direction (in plane)
         perp_axis = perp_axis / np.linalg.norm(perp_axis)
 
-        logger.info(f"Camera-based plane axes:")
-        logger.info(f"  Away axis: [{away_axis[0]:.3f}, {away_axis[1]:.3f}, {away_axis[2]:.3f}]")
-        logger.info(f"  Perp axis: [{perp_axis[0]:.3f}, {perp_axis[1]:.3f}, {perp_axis[2]:.3f}]")
+        logger.info(f'Camera-based plane axes:')
+        logger.info(f'  Away axis: [{away_axis[0]:.3f}, {away_axis[1]:.3f}, {away_axis[2]:.3f}]')
+        logger.info(f'  Perp axis: [{perp_axis[0]:.3f}, {perp_axis[1]:.3f}, {perp_axis[2]:.3f}]')
 
         # Project all points onto this camera-aligned coordinate system
         relative_points = clean_points - centroid
@@ -765,42 +751,48 @@ def o3d_plane_estimation(points):
 
         # Asymmetric extension: 10% towards camera, 50% away from camera, 20% perpendicular both sides
         away_extent_extended = away_extent * 1.6  # 60% larger in away direction (10% + 50%)
-        perp_extent_extended = perp_extent * 1.4  # 40% larger in perpendicular direction (20% each side)
+        perp_extent_extended = (
+            perp_extent * 1.4
+        )  # 40% larger in perpendicular direction (20% each side)
 
-        logger.info(f"Original extents: away={away_extent:.3f}m, perp={perp_extent:.3f}m")
-        logger.info(f"Extended extents: away={away_extent_extended:.3f}m, perp={perp_extent_extended:.3f}m")
+        logger.info(f'Original extents: away={away_extent:.3f}m, perp={perp_extent:.3f}m')
+        logger.info(
+            f'Extended extents: away={away_extent_extended:.3f}m, perp={perp_extent_extended:.3f}m'
+        )
 
         # Extension amounts for each direction
-        away_extension_near = away_extent * 0.1   # 10% extension towards camera (near side)
-        away_extension_far = away_extent * 0.5    # 50% extension away from camera (far side)
-        perp_extension = perp_extent * 0.2        # 20% extension on each perpendicular side
+        away_extension_near = away_extent * 0.1  # 10% extension towards camera (near side)
+        away_extension_far = away_extent * 0.5  # 50% extension away from camera (far side)
+        perp_extension = perp_extent * 0.2  # 20% extension on each perpendicular side
 
-        logger.info(f"Extensions: near={away_extension_near:.3f}m, far={away_extension_far:.3f}m, perp={perp_extension:.3f}m per side")
-        logger.info(f"Extending plane asymmetrically: 10% towards camera, 50% away from camera, 20% perpendicular both sides")
+        logger.info(
+            f'Extensions: near={away_extension_near:.3f}m, far={away_extension_far:.3f}m, perp={perp_extension:.3f}m per side'
+        )
+        logger.info(
+            f'Extending plane asymmetrically: 10% towards camera, 50% away from camera, 20% perpendicular both sides'
+        )
 
         corners = []
         for da in [-1, 1]:
             for dp in [-1, 1]:
                 # Asymmetric extension in away direction
                 if da == 1:  # Away from camera side - extend by 50%
-                    away_distance = away_extent/2 + away_extension_far
+                    away_distance = away_extent / 2 + away_extension_far
                 else:  # Near camera side - extend by 10%
-                    away_distance = da * (away_extent/2 + away_extension_near)
+                    away_distance = da * (away_extent / 2 + away_extension_near)
 
                 # Extend perpendicular direction by 20% on both sides
-                perp_distance = dp * (perp_extent/2 + perp_extension)
+                perp_distance = dp * (perp_extent / 2 + perp_extension)
 
-                corner = (centroid +
-                         away_distance * away_axis +
-                         perp_distance * perp_axis)
+                corner = centroid + away_distance * away_axis + perp_distance * perp_axis
                 corners.append(corner)
     else:
         # If plane is parallel to camera direction, use original v1/v2 system
-        logger.info("Plane parallel to camera direction, using original coordinate system")
+        logger.info('Plane parallel to camera direction, using original coordinate system')
         corners = []
         for dx in [-1, 1]:
             for dy in [-1, 1]:
-                corner = centroid + dx * (u_extent/2) * v1 + dy * (v_extent/2) * v2
+                corner = centroid + dx * (u_extent / 2) * v1 + dy * (v_extent / 2) * v2
                 corners.append(corner)
     corners = np.array(corners)
     # Create a quad mesh using trimesh
@@ -816,7 +808,7 @@ def o3d_plane_estimation(points):
     mesh = trimesh.Trimesh(
         vertices=vertices,
         faces=faces,
-        process=False  # Important: prevents automatic triangulation
+        process=False,  # Important: prevents automatic triangulation
     )
     # Optional: set face colors
     mesh.visual.face_colors = [128, 128, 128, 255]  # gray color (RGBA)

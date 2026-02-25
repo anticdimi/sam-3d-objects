@@ -333,9 +333,26 @@ class InferencePipelinePointMap(InferencePipeline):
 
     def run_post_optimization(self, mesh_glb, intrinsics, pose_dict, layout_input_dict):
         intrinsics = intrinsics.clone()
+        # MoGe may return intrinsics with a leading batch dim (1, 3, 3) — squeeze it.
+        if intrinsics.ndim == 3:
+            intrinsics = intrinsics.squeeze(0)
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         re_focal = min(fx, fy)
         intrinsics[0, 0], intrinsics[1, 1] = re_focal, re_focal
+
+        # The pose decoder converts predictions from SSI to metric space, so the
+        # pose in pose_dict is metric.  However, rgb_pointmap is still in SSI
+        # (normalized) space.  Denormalize it so both live in the same frame.
+        pointmap_ssi = layout_input_dict['rgb_pointmap'][0].clone()  # (3, H, W)
+        pm_scale = layout_input_dict.get('rgb_pointmap_scale')
+        pm_shift = layout_input_dict.get('rgb_pointmap_shift')
+        if pm_scale is not None and pm_shift is not None:
+            s = pm_scale[0].view(3, 1, 1)   # (3,) → (3,1,1)
+            t = pm_shift[0].view(3, 1, 1)
+            pointmap_metric = pointmap_ssi * s + t
+        else:
+            pointmap_metric = pointmap_ssi
+
         revised_quat, revised_t, revised_scale, final_iou, _, _ = (
             self.layout_post_optimization_method(
                 mesh_glb,
@@ -343,7 +360,7 @@ class InferencePipelinePointMap(InferencePipeline):
                 pose_dict['translation'],
                 pose_dict['scale'],
                 layout_input_dict['rgb_image_mask'][0, 0],
-                layout_input_dict['rgb_pointmap'][0].permute(1, 2, 0),
+                pointmap_metric.permute(1, 2, 0),
                 intrinsics,
                 min_size=518,
             )
@@ -433,6 +450,7 @@ class InferencePipelinePointMap(InferencePipeline):
 
             # Offload stage 1 models to save VRAM for stage 2
             self.move_to_cpu(['ss_generator', 'ss_decoder', 'ss_encoder', 'ss_condition_embedder'])
+            layout_input_dict = ss_input_dict if with_layout_postprocess else None
             del ss_input_dict
             torch.cuda.empty_cache()
 
@@ -453,23 +471,22 @@ class InferencePipelinePointMap(InferencePipeline):
             outputs = self.postprocess_slat_output(
                 outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
             )
-            # glb = outputs.get('glb', None)
+            glb = outputs.get('glb', None)
 
-            # try:
-            #     if with_layout_postprocess and self.layout_post_optimization_method is not None:
-            #         assert glb is not None, 'require mesh to run postprocessing'
-            #         logger.info('Running layout post optimization method...')
-            #         postprocessed_pose = self.run_post_optimization(
-            #             deepcopy(glb),
-            #             pointmap_dict['intrinsics'],
-            #             ss_return_dict,
-            #             ss_input_dict,
-            #         )
-            #         ss_return_dict.update(postprocessed_pose)
-            # except Exception as e:
-            #     logger.error(f'Error during layout post optimization: {e}', exc_info=True)
+            try:
+                if with_layout_postprocess and self.layout_post_optimization_method is not None:
+                    assert glb is not None, 'require mesh to run postprocessing'
+                    logger.info('Running layout post optimization method...')
+                    postprocessed_pose = self.run_post_optimization(
+                        deepcopy(glb),
+                        pointmap_dict['intrinsics'],
+                        ss_return_dict,
+                        layout_input_dict,
+                    )
+                    ss_return_dict.update(postprocessed_pose)
+            except Exception as e:
+                logger.error(f'Error during layout post optimization: {e}', exc_info=True)
 
-            # glb.export("sample.glb")
             logger.info('Finished!')
 
             return {
